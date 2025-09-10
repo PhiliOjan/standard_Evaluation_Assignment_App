@@ -1,107 +1,190 @@
-import streamlit as st
 import pandas as pd
-import numpy as np
+import streamlit as st
 
-# App title
-st.set_page_config(page_title="SE", layout="wide")
-st.title("SE Sampling & Assignment App")
+st.set_page_config(page_title="SE Contractor Assignment", layout="wide")
+st.title("📊 SE Contractor Assignment App")
 
-# File upload
-workplan_file = st.file_uploader("Upload Workplan (CSV/Excel)", type=["csv", "xlsx"])
-data_file = st.file_uploader("Upload Respondent Data (CSV/Excel)", type=["csv", "xlsx"])
+# ----------------- STEP 0: FILE UPLOAD -----------------
+ahs_workplan_file = st.file_uploader("Upload Workplan", type=["xlsx", "csv"])
+case_list_file = st.file_uploader("Upload Case List/Raw Dataset", type=["xlsx", "csv"])
 
-if workplan_file and data_file:
-    # Load files
-    if workplan_file.name.endswith(".csv"):
-        workplan = pd.read_csv(workplan_file)
+if ahs_workplan_file and case_list_file:
+    # ----------------- STEP 1: LOAD FILES -----------------
+    if ahs_workplan_file.name.endswith("csv"):
+        ahs_workplan_df = pd.read_csv(ahs_workplan_file)
     else:
-        workplan = pd.read_excel(workplan_file)
+        ahs_workplan_df = pd.read_excel(ahs_workplan_file)
 
-    if data_file.name.endswith(".csv"):
-        df = pd.read_csv(data_file)
+    if case_list_file.name.endswith("csv"):
+        case_list_df = pd.read_csv(case_list_file)
     else:
-        df = pd.read_excel(data_file)
+        case_list_df = pd.read_excel(case_list_file)
 
-    st.subheader("Uploaded Data Preview")
-    st.write("**Workplan**")
-    st.dataframe(workplan.head())
-    st.write("**Respondent Data**")
-    st.dataframe(df.head())
+    # ----------------- STEP 2: CLEAN TEXT -----------------
+    for col in ['district', 'cluster', 'village']:
+        case_list_df[col] = case_list_df[col].astype(str).str.strip().str.title()
 
-    # --- Check for mismatches between workplan and dataset ---
-    workplan_villages = set(workplan["village"].unique())
-    data_villages = set(df["village"].unique())
+    for col in ['District', 'Cluster', 'Villages']:
+        ahs_workplan_df[col] = ahs_workplan_df[col].astype(str).str.strip().str.title()
 
-    missing_in_data = workplan_villages - data_villages
-    missing_in_workplan = data_villages - workplan_villages
+    # Create unique identifier
+    case_list_df['villageidentifier'] = (
+        case_list_df['district'] + "_" + case_list_df['cluster'] + "_" + case_list_df['village']
+    )
+    ahs_workplan_df['villageidentifier'] = (
+        ahs_workplan_df['District'] + "_" + ahs_workplan_df['Cluster'] + "_" + ahs_workplan_df['Villages']
+    )
 
-    mismatch_summary = pd.DataFrame({
-        "Mismatch_Type": ["In Workplan, Not in Data", "In Data, Not in Workplan"],
-        "Villages": [", ".join(missing_in_data) if missing_in_data else "None",
-                     ", ".join(missing_in_workplan) if missing_in_workplan else "None"]
-    })
+    # Merge contractor info
+    merged_df = case_list_df.merge(
+        ahs_workplan_df[['villageidentifier', 'DAY', 'DATE', 'Contractors Code']],
+        on='villageidentifier',
+        how='left'
+    )
 
-    st.subheader("Village Mismatch Summary")
-    st.dataframe(mismatch_summary)
+    # Drop duplicate IDs if present
+    if 'id' in merged_df.columns:
+        merged_df.drop_duplicates(subset='id', keep='first', inplace=True)
 
-    # --- Sampling Function ---
-    def assign_samples(village_df):
-        np.random.seed(42)
-        village_df = village_df.sample(frac=1).reset_index(drop=True)  # shuffle
+    # ----------------- STEP 3: RANDOMIZE DATA -----------------
+    randomized_df = merged_df.sample(frac=1, random_state=None).reset_index(drop=True)
 
-        men = village_df[village_df["category"] == "Men"]
-        women = village_df[village_df["category"] == "Women"]
-        youth = village_df[village_df["category"] == "Youth"]
+    st.subheader("🔀 Randomized Respondents")
+    st.dataframe(randomized_df)
 
-        target = pd.DataFrame()
+    # ----------------- STEP 4: SAMPLING LOGIC -----------------
+    final_samples = []
 
-        # Try to allocate exact quota
-        men_target = men.head(9)
-        women_target = women.head(3)
-        youth_target = youth.head(3)
+    for village, village_df in randomized_df.groupby('village'):
+        men = village_df[village_df['headship'] == 'Men']
+        youth = village_df[village_df['headship'] == 'Youth']
+        women = village_df[village_df['headship'] == 'Women']
 
-        target = pd.concat([men_target, women_target, youth_target])
+        target_pool, reserve_pool, excess_pool = [], [], []
 
-        # If not enough respondents, prioritize Men -> Women -> Youth
-        if len(target) < 15:
-            remaining_needed = 15 - len(target)
-            remaining_pool = village_df.drop(target.index)
+        # --- Step A: Quotas: 9 Men, 3 Women, 3 Youth ---
+        men_target = men.iloc[:min(9, len(men))]
+        women_target = women.iloc[:min(3, len(women))]
+        youth_target = youth.iloc[:min(3, len(youth))]
 
-            extra = remaining_pool.head(remaining_needed)
-            target = pd.concat([target, extra])
+        target_pool.extend([men_target, women_target, youth_target])
 
-        # Mark status
-        village_df["status"] = "Excess"
-        village_df.loc[target.index, "status"] = "Target"
+        # --- Step B: Fill remaining slots up to 15, prioritizing Men > Women > Youth ---
+        current_target_count = sum(len(x) for x in target_pool)
+        needed = 15 - current_target_count
 
-        # Select 15 Reserve if possible
-        remaining_pool = village_df[village_df["status"] == "Excess"]
-        reserve = remaining_pool.head(15 - len(target))
-        village_df.loc[reserve.index, "status"] = "Reserve"
+        if needed > 0:
+            extra_men = men.drop(men_target.index)
+            take = min(needed, len(extra_men))
+            target_pool.append(extra_men.iloc[:take])
+            needed -= take
 
-        return village_df
+        if needed > 0:
+            extra_women = women.drop(women_target.index)
+            take = min(needed, len(extra_women))
+            target_pool.append(extra_women.iloc[:take])
+            needed -= take
 
-    # Apply to each village
-    assigned_df = df.groupby("village", group_keys=False).apply(assign_samples)
+        if needed > 0:
+            extra_youth = youth.drop(youth_target.index)
+            take = min(needed, len(extra_youth))
+            target_pool.append(extra_youth.iloc[:take])
+            needed -= take
 
-    # --- Downloads ---
-    st.subheader("Download Outputs")
+        # --- Step C: Build target group ---
+        target = pd.concat(target_pool) if target_pool else pd.DataFrame()
+        target['status'] = 'Target'
+
+        # --- Step D: Reserve group (next available) ---
+        reserve_candidates = pd.concat([
+            men.drop(target.index, errors='ignore'),
+            women.drop(target.index, errors='ignore'),
+            youth.drop(target.index, errors='ignore')
+        ])
+        reserve = reserve_candidates.iloc[:15]
+        reserve['status'] = 'Reserve'
+
+        # --- Step E: Excess group ---
+        excess = reserve_candidates.drop(reserve.index, errors='ignore')
+        excess['status'] = 'Excess'
+
+        village_samples = pd.concat([target, reserve, excess])
+        final_samples.append(village_samples)
+
+    sampled_df = pd.concat(final_samples, ignore_index=True)
+
+    # ----------------- STEP 5: CONTRACTOR ASSIGNMENT -----------------
+    def assign_contractor(group):
+        codes = group['Contractors Code'].iloc[0]
+        if pd.isna(codes) or not isinstance(codes, str):
+            group['assigned_contractor'] = "Not Assigned"
+            return group
+        clean_codes = [c.strip() for c in codes.split(',') if c.strip()]
+        contractor = clean_codes[hash(group['villageidentifier'].iloc[0]) % len(clean_codes)]
+        group['assigned_contractor'] = contractor
+        return group
+
+    final_df = sampled_df.groupby(['villageidentifier', 'DAY'], group_keys=False).apply(assign_contractor)
+    final_df = final_df.drop(columns=['villageidentifier'])
+
+    # ----------------- STEP 6: DISPLAY -----------------
+    st.success("✅ Processing Complete!")
+
+    st.subheader("🎯 Target Respondents (per village)")
+    target_preview = final_df[final_df['status'] == 'Target']
+    st.dataframe(target_preview)
+
+    st.subheader("📋 Final Assigned Cases")
+    st.dataframe(final_df)
+
+    # ----------------- STEP 7: MISMATCH CHECK -----------------
+    st.subheader("⚠️ Workplan vs Case List Mismatches")
+
+    # Normalize column names
+    ahs_workplan_df.columns = ahs_workplan_df.columns.str.strip().str.lower()
+    case_list_df.columns = case_list_df.columns.str.strip().str.lower()
+
+    if "villageidentifier" in ahs_workplan_df.columns and "villageidentifier" in case_list_df.columns:
+        workplan_villages = set(ahs_workplan_df["villageidentifier"].unique())
+        case_villages = set(case_list_df["villageidentifier"].unique())
+
+        missing_in_data = workplan_villages - case_villages
+        missing_in_workplan = case_villages - workplan_villages
+
+        mismatch_summary = pd.DataFrame({
+            "Mismatch Type": [
+                "In Workplan, Not in Case List",
+                "In Case List, Not in Workplan"
+            ],
+            "Villages": [
+                ", ".join(sorted(missing_in_data)) if missing_in_data else "None",
+                ", ".join(sorted(missing_in_workplan)) if missing_in_workplan else "None"
+            ]
+        })
+
+        st.dataframe(mismatch_summary, use_container_width=True)
+
+    else:
+        st.error("⚠️ Column 'villageidentifier' not found in one or both files. Please check your uploads.")
+
+    # ----------------- STEP 8: DOWNLOADS -----------------
     st.download_button(
-        "Download Randomised Data (All Respondents)",
-        df.to_csv(index=False).encode("utf-8"),
-        "randomised_data.csv",
-        "text/csv"
+        "⬇️ Download Randomized Data (with Status)",
+        data=sampled_df.to_csv(index=False),
+        file_name="randomized_with_status.csv",
+        mime="text/csv"
     )
 
     st.download_button(
-        "Download Assigned Data (With Target/Reserve/Excess)",
-        assigned_df.to_csv(index=False).encode("utf-8"),
-        "assigned_data.csv",
-        "text/csv"
+        "⬇️ Download Target Respondents Only",
+        data=target_preview.to_csv(index=False),
+        file_name="target_respondents.csv",
+        mime="text/csv"
     )
 
-    # --- Show Assigned Sample ---
-    st.subheader("Assigned Data Preview")
-    st.dataframe(assigned_df.head(50))
-
-
+    st.download_button(
+        "⬇️ Download Final Assigned Data",
+        data=final_df.to_csv(index=False),
+        file_name="assigned_data.csv",
+        mime="text/csv"
+    )
